@@ -4,77 +4,97 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+
+	"github.com/chronos-tachyon/go-autolog"
+	"github.com/rs/zerolog/log"
+
+	"github.com/chronos-tachyon/go-dedupe/internal/glob"
+	"github.com/chronos-tachyon/go-dedupe/internal/metadata"
+	"github.com/chronos-tachyon/go-dedupe/internal/stack"
+)
+
+type (
+	MD5Sum    = metadata.MD5Sum
+	SHA1Sum   = metadata.SHA1Sum
+	SHA256Sum = metadata.SHA256Sum
+	Stack     = stack.Stack[*Item]
 )
 
 var (
+	flagXdev    bool
 	flagRescan  bool
 	flagRewrite bool
+	flagMinSize int64
+	flagNS      string
+	flagRules   Rules
 )
 
+var gNames metadata.Names = metadata.DefaultNames()
+
 func init() {
+	flag.BoolVar(&flagXdev, "xdev", false, "don't recurse into different filesystems")
 	flag.BoolVar(&flagRescan, "rescan", false, "don't trust memoized hashes at all")
-	flag.BoolVar(&flagRewrite, "rewrite", false, "upgrade memoized hashes to current format")
+	flag.Int64Var(&flagMinSize, "min-size", 1, "don't scan files with fewer bytes than this")
+	flag.StringVar(&flagNS, "ns", "user.dedupe.", "xattr namespace to use")
+	flag.Func("include", "glob pattern to include", func(in string) error {
+		rx, err := glob.Compile(in)
+		if err != nil {
+			return err
+		}
+		flagRules = append(flagRules, Rule{Pattern: rx, Exclude: false})
+		return nil
+	})
+	flag.Func("exclude", "glob pattern to exclude", func(in string) error {
+		rx, err := glob.Compile(in)
+		if err != nil {
+			return err
+		}
+		flagRules = append(flagRules, Rule{Pattern: rx, Exclude: true})
+		return nil
+	})
 }
 
 func main() {
+	autolog.Init()
+	defer func() {
+		err := autolog.Done()
+		if err != nil {
+			panic(err)
+		}
+	}()
 	flag.Parse()
+	gNames.Stamp = flagNS + "stamp"
 
-	stack := make(Stack[Item], 0, 256)
+	stack := make(Stack, 0, 256)
 	defer func() {
 		for !stack.IsEmpty() {
-			item := stack.Pop()
-			_ = item.Close()
+			stack.Pop().Close()
 		}
 	}()
 
 	for _, rootPath := range flag.Args() {
-		var item Item
-		if err := item.Open(filepath.Clean(rootPath)); err != nil {
-			panic(err)
+		if it := Open(filepath.Clean(rootPath)); it != nil {
+			stack.Push(it)
 		}
-		stack.Push(item)
 	}
 
-	seen := make(map[Key][]string, 1<<20)
+	seen := make(map[SHA256Sum][]string, 1<<20)
 	for !stack.IsEmpty() {
-		if err := Scan(&stack, seen, stack.Pop()); err != nil {
-			panic(err)
-		}
+		Scan(&stack, seen, stack.Pop())
 	}
 
-	keys := make([]Key, 0, len(seen))
-	for key := range seen {
-		keys = append(keys, key)
-	}
-	sort.Sort(KeyList(keys))
-
-	seenByHash := make(map[SHA256Sum][]string, len(keys))
-	for _, key := range keys {
-		subPaths := seen[key]
-		sort.Strings(subPaths)
-
-		paths := seenByHash[key.Hash]
-		if paths == nil {
-			paths = make([]string, 0, 1)
-		}
-		paths = append(paths, subPaths[0])
-		seenByHash[key.Hash] = paths
-	}
-
-	hashes := make([]SHA256Sum, 0, len(seenByHash))
-	for hash := range seenByHash {
+	hashes := make(SHA256List, 0, len(seen))
+	for hash := range seen {
 		hashes = append(hashes, hash)
 	}
-	sort.Sort(SHA256List(hashes))
+	hashes.Sort()
 
 	results := make([][]string, 0, len(hashes))
 	for _, hash := range hashes {
-		paths := seenByHash[hash]
+		paths := seen[hash]
 		if len(paths) <= 1 {
 			continue
 		}
@@ -93,130 +113,147 @@ func main() {
 	}
 }
 
-func Scan(stack *Stack[Item], seen map[Key][]string, item Item) error {
-	switch item.Info.Mode().Type() {
+func Scan(stack *Stack, seen map[SHA256Sum][]string, it *Item) {
+	defer it.Close()
+	switch it.Mode.Type() {
 	case 0:
-		return ScanFile(seen, item)
+		ScanFile(seen, it)
 	case fs.ModeDir:
-		return ScanDir(stack, seen, item)
-	default:
-		return item.Close()
+		ScanDir(stack, seen, it)
 	}
 }
 
-func ScanDir(stack *Stack[Item], seen map[Key][]string, item Item) error {
-	needClose := true
-	defer func() {
-		if needClose {
-			_ = item.Close()
-		}
-	}()
-
-	dents, err := item.File.ReadDir(-1)
-	if err != nil {
-		return fmt.Errorf("%q: failed to read directory: %w", item.Path, err)
+func ScanDir(stack *Stack, seen map[SHA256Sum][]string, it *Item) {
+	if flagRules.Exclude(it) {
+		return
 	}
 
+	log.Logger.Debug().
+		Str("path", it.Path).
+		Msg("scan directory")
+
+	dents, err := it.File.ReadDir(-1)
+	if err != nil {
+		log.Logger.Error().
+			Str("path", it.Path).
+			Err(err).
+			Msg("failed to read directory")
+		return
+	}
+
+	var child *Item
 	for _, dent := range dents {
 		fileName := dent.Name()
 		if fileName == "." || fileName == ".." {
 			continue
 		}
 
+		filePath := filepath.Join(it.Path, fileName)
 		fileType := dent.Type()
 		switch fileType {
 		case 0:
 			// pass
 		case fs.ModeDir:
 			// pass
+		case fs.ModeSymlink:
+			targetInfo, err := os.Stat(filePath)
+			if err != nil {
+				continue
+			}
+			if targetType := targetInfo.Mode().Type(); targetType != 0 {
+				continue
+			}
+			fileType = 0
 		default:
 			continue
 		}
 
-		var child Item
-		if err := child.Open(filepath.Join(item.Path, fileName)); err != nil {
-			return err
+		child.Close()
+		child = Open(filePath)
+		if child == nil {
+			continue
+		}
+		fileType2 := child.Mode.Type()
+
+		if child.Dev != it.Dev {
+			if flagXdev {
+				continue
+			}
+			if fileType != fileType2 {
+				continue
+			}
 		}
 
-		fileType2 := child.Info.Mode().Type()
 		if fileType != fileType2 {
-			_ = child.Close()
-			return fmt.Errorf("%q: file type mismatch: ReadDir said %v, but Stat said %v", child.Path, fileType, fileType2)
+			log.Logger.Error().
+				Str("path", child.Path).
+				Stringer("readDirType", fileType).
+				Stringer("statType", fileType2).
+				Msg("file type mismatch")
+			continue
 		}
 
 		if fileType == fs.ModeDir {
 			stack.Push(child)
+			child = nil
 			continue
 		}
 
-		if err := ScanFile(seen, child); err != nil {
-			return err
-		}
+		ScanFile(seen, child)
 	}
-
-	needClose = false
-	return item.Close()
+	child.Close()
 }
 
-func ScanFile(seen map[Key][]string, item Item) error {
-	needClose := true
-	defer func() {
-		if needClose {
-			_ = item.Close()
-		}
-	}()
-
-	var md Metadata
-	loaded := false
-	if !flagRescan {
-		ok, err := md.Load(item.File)
-		if err != nil {
-			return err
-		}
-		loaded = ok
+func ScanFile(seen map[SHA256Sum][]string, it *Item) {
+	if it.Size < flagMinSize {
+		return
+	}
+	if flagRules.Exclude(it) {
+		return
 	}
 
-	size := item.Info.Size()
-	modTime := item.Info.ModTime()
-	dirty := false
-	if !loaded || !md.Check(size, modTime) {
-		if err := md.Compute(item.File, size, modTime); err != nil {
-			return err
-		}
-		dirty = true
+	log.Logger.Debug().
+		Str("path", it.Path).
+		Msg("scan file")
+
+	var meta metadata.Metadata
+	hasAll := meta.Load(it.File, gNames)
+
+	needRescan := flagRescan
+	if !needRescan && !hasAll {
+		log.Logger.Info().
+			Str("path", it.Path).
+			Str("reason", "missing metadata").
+			Stringer("bitsFound", meta.Bits).
+			Stringer("bitsMissing", metadata.AllBits&^meta.Bits).
+			Msg("hash file")
+		needRescan = true
+	}
+	if !needRescan && !meta.Check(it.Size, it.Time) {
+		log.Logger.Info().
+			Str("path", it.Path).
+			Str("reason", "outdated metadata").
+			Int64("oldSize", meta.Size).
+			Int64("oldTime", meta.Time).
+			Int64("newSize", it.Size).
+			Int64("newTime", it.Time).
+			Msg("hash file")
+		needRescan = true
+	}
+	if needRescan {
+		hasAll = meta.Compute(it.File, it.Size, it.Time)
+	}
+	if !hasAll {
+		return
 	}
 
-	if dirty || flagRewrite {
-		if err := md.Save(item.File); err != nil {
-			return err
-		}
-	}
+	meta.Save(it.File, gNames)
 
-	key := Key{Hash: md.SHA256, Dev: item.Dev, Ino: item.Ino}
-	list := seen[key]
+	hash := meta.SHA256
+	list := seen[hash]
 	if list == nil {
 		list = make([]string, 0, 1)
 	}
-	list = append(list, item.Path)
-	seen[key] = list
-
-	needClose = false
-	return item.Close()
-}
-
-type Key struct {
-	Hash SHA256Sum
-	Dev  uint64
-	Ino  uint64
-}
-
-func (key Key) CompareTo(other Key) int {
-	cmp := CompareSHA256(key.Hash, other.Hash)
-	if cmp == 0 {
-		cmp = CompareUint64(key.Dev, other.Dev)
-	}
-	if cmp == 0 {
-		cmp = CompareUint64(key.Ino, other.Ino)
-	}
-	return cmp
+	list = append(list, it.Path)
+	seen[hash] = list
 }
